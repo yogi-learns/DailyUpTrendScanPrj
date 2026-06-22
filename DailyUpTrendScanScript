@@ -1,0 +1,390 @@
+/** Telegram stuff */
+const TG_TOKEN = "XXXXXXX";
+const TG_CHAT_ID = "XXXXXXXXX";
+
+// Send msg on telegram
+function sendTelegram(text) {
+  const url = "https://api.telegram.org/bot" + TG_TOKEN + "/sendMessage";
+  const payload = {
+    chat_id: TG_CHAT_ID,
+    text: text,
+    parse_mode: "HTML"
+  };
+
+  const params = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  UrlFetchApp.fetch(url, params);
+}
+
+/**
+ * STEP 1 — Build historical OHLC blocks in HIST sheet for each symbol.
+ * The blocks allow reliable EMA and Heiken-Ashi calculations.
+ */
+
+function populateHistoryBlocks() {
+  console.log('Starting populateHistoryBlocks function');
+  const ss = SpreadsheetApp.getActive();
+  const main = ss.getSheetByName('Main');
+  let hist = ss.getSheetByName('HIST');
+  if (!hist) hist = ss.insertSheet('HIST');
+  hist.clear();
+
+  const symbols = main.getRange('A2:A').getValues()
+    .map(r => r[0])
+    .filter(v => v && typeof v === 'string');
+
+  const DAYS = 140;
+  const GAP = 2;
+
+  for (let i = 0; i < symbols.length; i++) {
+    const sym = symbols[i];
+    const rowStart = 1 + i * (DAYS + 3 + GAP);
+
+    hist.getRange(rowStart, 1).setValue(sym);
+    hist.getRange(rowStart + 2, 1).setFormula(
+      `=IFERROR(GOOGLEFINANCE("NSE:${sym}","open",TODAY()-${DAYS},TODAY()),)`
+    );
+    hist.getRange(rowStart + 2, 3).setFormula(
+      `=IFERROR(GOOGLEFINANCE("NSE:${sym}","high",TODAY()-${DAYS},TODAY()),)`
+    );
+    hist.getRange(rowStart + 2, 5).setFormula(
+      `=IFERROR(GOOGLEFINANCE("NSE:${sym}","low",TODAY()-${DAYS},TODAY()),)`
+    );
+    hist.getRange(rowStart + 2, 7).setFormula(
+      `=IFERROR(GOOGLEFINANCE("NSE:${sym}","close",TODAY()-${DAYS},TODAY()),)`
+    );
+  }
+
+ for (let i = 0; i < symbols.length; i++) {
+    const sym = symbols[i];
+    const rowStart = 1 + i * (DAYS + 3 + GAP);
+
+    hist.getRange(rowStart + 2 + DAYS, 2).setFormula(
+      `=IFERROR(GOOGLEFINANCE("NSE:${sym}","priceopen"),)`
+    );
+    hist.getRange(rowStart + 2 + DAYS, 4).setFormula(
+      `=IFERROR(GOOGLEFINANCE("NSE:${sym}","high"),)`
+    );
+    hist.getRange(rowStart + 2 + DAYS, 6).setFormula(
+      `=IFERROR(GOOGLEFINANCE("NSE:${sym}","low"),)`
+    );
+    hist.getRange(rowStart + 2 + DAYS, 8).setFormula(
+      `=IFERROR(GOOGLEFINANCE("NSE:${sym}","price"),)`
+    );
+ };
+
+  //SpreadsheetApp.getUi().alert("Historical blocks created in HIST sheet.");
+}
+
+/**
+ * Utility: Compute EMA for an array of numbers.
+ */
+function computeEMA(values, period) {
+  if (!values || values.length === 0) return null;
+  const k = 2 / (period + 1);
+  let ema = values[0];
+  for (let i = 1; i < values.length; i++) {
+    ema = values[i] * k + ema * (1 - k);
+  }
+  return Math.round(ema * 100) / 100;
+}
+
+function setQueryFormula(targetSheetName, targetRangeA1, sourceSheetName, sourceRangeA1, querySQL, headers = 1) {
+
+  const ss = SpreadsheetApp.getActive();
+  const targetSheet = ss.getSheetByName(targetSheetName);
+  const sourceSheet = ss.getSheetByName(sourceSheetName);
+
+  if (!targetSheet) throw new Error(`Target sheet "${targetSheetName}" not found.`);
+  if (!sourceSheet) throw new Error(`Source sheet "${sourceSheetName}" not found.`);
+
+  // Build final QUERY formula string
+  const formula =
+    `=QUERY(${sourceSheetName}!${sourceRangeA1}, "${querySQL}", ${headers})`;
+
+  // Write the formula
+  targetSheet.getRange(targetRangeA1).setFormula(formula);
+}
+
+/**
+ * Clears all rows from A5:C down to the last used row.
+ *
+ * @param {string} sheetName - Name of the sheet to clear
+ */
+function clearSheet(sheetName) {
+
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(sheetName);
+  sh.clear();
+}
+
+function createBuyListQuery() {
+  clearSheet("SendTelegramTable");
+  setQueryFormula(
+    "SendTelegramTable",
+    "A1",
+    "Main",
+    "A2:I",
+    "select A,I where H='BUY'",
+    0
+  );
+}
+
+/**
+ * STEP 2 — Read OHLC from HIST blocks and compute:
+ *  - EMA 8
+ *  - EMA 21
+ *  - EMA 50
+ *  - Heiken Ashi Open / Close
+ *  - Signal
+ *
+ * Writes results into Main!C:D:E:F:G:H.
+ */
+/**
+ * Robust fillIndicators() - computes EMA8/21/50, Heiken-Ashi arrays correctly, writes to Main.
+ * Assumes HIST sheet contains per-symbol blocks arranged exactly like populateHistoryBlocks created.
+ *
+ * Writes to Main columns:
+ *  C = EMA8, D = EMA21, E = EMA50, F = HA_Open (latest), G = HA_Close (latest), H = Signal ("BUY"/"NoSignal")
+ */
+function fillIndicators() {
+  const output = [];
+  // Fill Main sheet
+  console.log('Starting fillIndicators function');
+  const ss = SpreadsheetApp.getActive();
+  const main = ss.getSheetByName('Main');
+  const hist = ss.getSheetByName('HIST');
+  if (!main || !hist) {
+    SpreadsheetApp.getUi().alert('Missing Main or HIST sheet');
+    return;
+  }
+
+  // Read symbols from Main!A2:A (stop at first blank)
+  const symsData = main.getRange('A2:A').getValues();
+  const symbols = [];
+  for (let i = 0; i < symsData.length; i++) {
+    const s = (symsData[i][0] || '').toString().trim();
+    if (!s) break;
+    symbols.push(s);
+  }
+  if (symbols.length === 0) {
+    SpreadsheetApp.getUi().alert('No symbols found in Main!A2:A');
+    return;
+  }
+
+  const DAYS = 140;
+  const BLOCK = DAYS + 3 + 2; // matches populateHistoryBlocks layout
+
+  for (let i = 0; i < symbols.length; i++) {
+    const sym = symbols[i];
+    const blockTop = 1 + i * BLOCK; // 1-indexed top row for this symbol block
+    //console.log("Getting data for symbol: " + sym);
+    // Read the block columns: Date (col 1), Open (2), Date (col 3), High (4), Date (col 5), Low (6), Date (col 7), Close (8)
+    // Data starts at row blockTop + 3 (header at blockTop+2), first data row at blockTop+3
+    try {
+      const openRange = hist.getRange(blockTop + 3, 2, DAYS, 1).getValues();
+      const highRange = hist.getRange(blockTop + 3, 4, DAYS, 1).getValues();
+      const lowRange  = hist.getRange(blockTop + 3, 6, DAYS, 1).getValues();
+      const closeRange= hist.getRange(blockTop + 3, 8, DAYS, 1).getValues();
+
+      //console.log("Mapping ranges for symbol: " + sym);
+      const closes = closeRange.map(r => r[0]).filter(v => typeof v === 'number');
+      const opens  = openRange.map(r => r[0]).filter(v => typeof v === 'number');
+      const highs  = highRange.map(r => r[0]).filter(v => typeof v === 'number');
+      const lows   = lowRange.map(r => r[0]).filter(v => typeof v === 'number');
+
+      // Need at least 50 valid closes for EMA50 and HA prev day
+      //console.log("Checking range data length for symbol: " + sym + " Symbol.length: " + closes.length);
+      // if (closes.length < 50) {
+      //   // Clear outputs if insufficient data
+      //   main.getRange(i + 2, 3, 1, 6).clearContent();
+      //   continue;
+      // }
+
+      // Compute EMAs (arrays expect oldest->newest). computeEMA uses that order
+      //console.log("Calc EMA for symbol: " + sym);
+      const ema8  = computeEMA(closes, 8);
+      const ema21 = computeEMA(closes, 21);
+      const ema50 = computeEMA(closes, 50);
+
+      // Compute Heiken-Ashi arrays properly (same length as closes)
+      const n = closes.length;
+      const haCloseArr = new Array(n);
+      const haOpenArr  = new Array(n);
+
+      // haClose = (open + high + low + close) / 4  (per day)
+      for (let t = 0; t < n; t++) {
+        haCloseArr[t] = Math.round(((opens[t] + highs[t] + lows[t] + closes[t]) / 4) * 100) / 100;
+      }
+
+      // haOpen[0] initialize -> commonly (open0 + close0)/2 or use opens[0]; we'll use (open0+close0)/2
+      haOpenArr[0] = (opens[0] + closes[0]) / 2;
+
+      // then for t>=1: haOpen[t] = (haOpen[t-1] + haClose[t-1]) / 2
+      for (let t = 1; t < n; t++) {
+        haOpenArr[t] = Math.round(((haOpenArr[t - 1] + haCloseArr[t - 1]) / 2) * 100) / 100;
+      }
+
+      // Latest values are at index n-1, previous at n-2
+      const haCloseLatest = haCloseArr[n - 1];
+      const haOpenLatest  = haOpenArr[n - 1];
+      const haClosePrev   = haCloseArr[n - 2];
+      const haOpenPrev    = haOpenArr[n - 2];
+
+      // Safety checks (ensure numeric)
+      // if (![ema8, ema21, ema50, haCloseLatest, haOpenLatest, haClosePrev, haOpenPrev].every(v => isFinite(v))) {
+      //   main.getRange(i + 2, 3, 1, 6).clearContent();
+      //   continue;
+      // }
+
+      // Signal logic
+      const trendUp = (ema8 > ema21) && (ema21 > ema50);
+      const haBullToday = haCloseLatest > haOpenLatest;
+      const haBearYesterday = haClosePrev < haOpenPrev;
+      const signal = (trendUp && haBullToday && haBearYesterday) ? "BUY" : "NoSignal";
+
+      // --- Telegram Alerts ---
+      if (signal === "BUY") {
+        const msg =
+          "🚀 <b>BUY Signal Triggered</b>\n\n" +
+          "📌 <b>Symbol:</b> " + sym + "\n\n" +
+          "📈 EMA8 > EMA21 > EMA50\n" +
+          "🟩 Today HA: Bullish\n" +
+          "🟥 Yesterday HA: Bearish\n\n" +
+          "🎯 TradingView Chart: https://www.tradingview.com/chart/?symbol=NSE:" + sym + "\n\n" +
+          "⏰ Time: " + new Date().toLocaleString() + "\n" + "\n";
+
+        //sendTelegram(msg);
+      };
+
+      // Write to Main
+      //console.log('Populating values for - ' + sym + ' EMA8: ' + ema8 + ' EMA21: ' + ema21 + ' EMA50: ' + ema50);
+      // main.getRange(i + 2, 3).setValue(ema8);             // C = EMA8
+      // main.getRange(i + 2, 4).setValue(ema21);            // D = EMA21
+      // main.getRange(i + 2, 5).setValue(ema50);            // E = EMA50
+      // main.getRange(i + 2, 6).setValue(haOpenLatest);     // F = HA Open (latest)
+      // main.getRange(i + 2, 7).setValue(haCloseLatest);    // G = HA Close (latest)
+      // main.getRange(i + 2, 8).setValue(signal);           // H = Signal
+      
+      // Capture all calc values in memory
+      output.push([
+        ema8, ema21, ema50,
+        haOpenLatest, haCloseLatest,
+        signal
+      ]);
+      // if (signal === "BUY") {
+      //   main.getRange(i + 2, 8).setBackground("#90EE90");   // H = Light Green
+      // } else {
+      //   main.getRange(i + 2, 8).setBackground(null);
+      // };
+
+      //console.log('Sleeping for 100ms');
+      //Utilities.sleep(100); // 100 ms
+    } catch (err) {
+      // On any per-symbol failure, clear outputs and continue
+      main.getRange(i + 2, 3, 1, 6).clearContent();
+      console.error('Error processing', sym, err);
+      continue;
+    }
+  }
+  // Write all output values in one go
+  main.getRange(2, 3, output.length, 6).setValues(output);
+
+  // optional: notify when done
+  //SpreadsheetApp.getUi().alert('Indicators updated in Main sheet.');
+  //console.log('Sorting Main sheet by Signal asc');
+  main.getRange("A2:H").sort(8);
+}
+
+/**
+ * Removes blank rows from a specified source range and writes the 
+ * non-blank rows to a destination range.
+ */
+function removeBlankRowsAndReturnNewRange(sheetName, rangeA1) {
+  const ss = SpreadsheetApp.getActive();
+  const sourceSheet = ss.getSheetByName(sheetName);
+  const destinationSheet = ss.getSheetByName(sheetName);
+  
+  // Define the source range (e.g., A1:D20)
+  const sourceRange = sourceSheet.getRange(rangeA1);
+  const values = sourceRange.getValues();
+
+  // Filter out rows where all cells are empty
+  const filteredValues = values.filter(row => row.join("") !== "");
+
+  // Clear previous content in the destination area (optional, depending on use case)
+  destinationSheet.clearContents();
+
+  // Write the filtered data to the destination sheet, starting from A1
+  if (filteredValues.length > 0) {
+    const newRange = destinationSheet.getRange(
+      1, 
+      1, 
+      filteredValues.length, 
+      filteredValues[0].length // Assumes all rows have same number of columns
+    );
+    newRange.setValues(filteredValues);
+    
+    // Log the new range location and size
+    // console.log("New range created at: " + newRange.getA1Notation());
+    return newRange.getA1Notation(); // Return the new range object startCell
+  } else {
+    console.log("No non-blank rows found.");
+    return null;
+  }
+}
+
+function sendTableToTelegram(sheetName, rangeA1) {
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName(sheetName);
+
+  const values = sheet.getRange(rangeA1).getValues();
+
+  if (!values || values.length === 0) {
+    sendTelegram("⚠ No data found in " + sheetName + "!" );
+    return;
+  }
+
+  // Convert to formatted Markdown table
+  let current = "🚀 <b>BUY Signal Triggered</b>\n⏰ Time: " + new Date().toLocaleString() + "\n";
+  current += "📌 Symbol | 🎯 TradingViewLink | 🟩 Signal\n";
+  const maxLen = 3500;  // safe limit
+
+  values.forEach(r => {
+    const line = r.join(" | ") + "\n";
+
+    if ((current + line).length > maxLen) {
+      sendTelegram(`<pre>${current}</pre>`);
+      current = "";
+    }
+    current += line;
+  });
+
+  if (current.trim() !== "") {
+    sendTelegram(`<pre>${current}</pre>`);
+  }
+
+}
+
+function sendBuySignals() {
+  console.log("Sending Telegram msg");
+  sendTableToTelegram("SendTelegramTable", removeBlankRowsAndReturnNewRange("SendTelegramTable", "A1:C200"));
+}
+
+function UpdateScan() {
+  populateHistoryBlocks();
+  SpreadsheetApp.flush();
+  Utilities.sleep(1000); // 1000 ms
+  fillIndicators();
+  SpreadsheetApp.flush();
+  createBuyListQuery();
+  SpreadsheetApp.flush();
+  sendBuySignals();
+}
+
+// End Of Script
